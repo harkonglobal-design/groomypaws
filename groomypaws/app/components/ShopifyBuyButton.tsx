@@ -10,13 +10,23 @@ const SCRIPT_URL =
 const MONEY_FORMAT = "%24%7B%7Bamount%7D%7D";
 
 // Minimal typing for the global the SDK attaches to window.
+type ShopifyComponent = { destroy?: () => void };
+
+type ShopifyUI = {
+  createComponent: (
+    type: string,
+    config: Record<string, unknown>
+  ) => Promise<ShopifyComponent> | ShopifyComponent;
+  // The SDK tracks every component it creates (product, cart, toggle, modal)
+  // here so we can tear them all down on unmount.
+  components?: Record<string, ShopifyComponent[] | undefined>;
+};
+
 declare global {
   interface Window {
     ShopifyBuy?: {
       UI?: {
-        onReady: (client: unknown) => Promise<{
-          createComponent: (type: string, config: Record<string, unknown>) => void;
-        }>;
+        onReady: (client: unknown) => Promise<ShopifyUI>;
       };
       buildClient: (config: { domain: string; storefrontAccessToken: string }) => unknown;
     };
@@ -25,27 +35,73 @@ declare global {
 
 export default function ShopifyBuyButton() {
   const nodeRef = useRef<HTMLDivElement>(null);
-  // Guards against React StrictMode double-mounting the component in dev.
-  const initialized = useRef(false);
 
   useEffect(() => {
-    if (initialized.current || !nodeRef.current) return;
-    initialized.current = true;
+    const node = nodeRef.current;
+    if (!node) return;
+
+    // Cancellation flag: onReady()/createComponent() are async and can resolve
+    // *after* this effect has been cleaned up (StrictMode, fast navigation).
+    // Without this, those late resolutions create orphaned body-level widgets.
+    let cancelled = false;
+    let ui: ShopifyUI | null = null;
+    let productComponent: ShopifyComponent | null = null;
+
+    // The SDK appends the cart, toggle and modal as iframes directly to <body>,
+    // outside React's tree, so they survive unmount unless we remove them. This
+    // is what leaves a stray floating cart toggle showing "0" on screen.
+    function sweepOrphanFrames() {
+      document
+        .querySelectorAll<HTMLElement>(".shopify-buy-frame")
+        .forEach((el) => {
+          // Leave the product button (rendered inside our own node) alone.
+          if (!node || !node.contains(el)) el.remove();
+        });
+    }
+
+    function teardown() {
+      try {
+        productComponent?.destroy?.();
+      } catch {
+        /* component may already be gone */
+      }
+      // Destroy every component the SDK created (cart, toggle, modal, …).
+      const groups = ui?.components;
+      if (groups) {
+        for (const group of Object.values(groups)) {
+          group?.forEach((c) => {
+            try {
+              c?.destroy?.();
+            } catch {
+              /* ignore */
+            }
+          });
+        }
+      }
+      sweepOrphanFrames();
+    }
 
     function init() {
       const ShopifyBuy = window.ShopifyBuy;
-      if (!ShopifyBuy?.UI || !nodeRef.current) return;
+      if (cancelled || !ShopifyBuy?.UI || !node) return;
+
+      // Clear any widgets left over from a previous mount/HMR cycle before we
+      // create fresh ones, so toggles can never stack up.
+      sweepOrphanFrames();
 
       const client = ShopifyBuy.buildClient({
         domain: SHOPIFY_DOMAIN,
         storefrontAccessToken: STOREFRONT_ACCESS_TOKEN,
       });
 
-      ShopifyBuy.UI.onReady(client).then((ui) => {
-        ui.createComponent("product", {
-          id: PRODUCT_ID,
-          node: nodeRef.current,
-          moneyFormat: MONEY_FORMAT,
+      ShopifyBuy.UI.onReady(client).then((readyUi) => {
+        if (cancelled) return;
+        ui = readyUi;
+        Promise.resolve(
+          readyUi.createComponent("product", {
+            id: PRODUCT_ID,
+            node,
+            moneyFormat: MONEY_FORMAT,
           options: {
             product: {
               // Let the button fill our container instead of the embed's grid sizing.
@@ -147,18 +203,28 @@ export default function ShopifyBuyButton() {
               googleFonts: ["Oxygen"],
             },
           },
+          })
+        ).then((comp) => {
+          productComponent = comp;
+          // Unmounted while createComponent was in flight → clean up immediately.
+          if (cancelled) teardown();
         });
       });
     }
 
     if (window.ShopifyBuy?.UI) {
       init();
-    } else if (window.ShopifyBuy) {
-      // Library present but UI not loaded yet — load the full script.
-      loadScript(init);
     } else {
+      // Library missing or its UI module hasn't loaded yet — load the script.
       loadScript(init);
     }
+
+    // On unmount, cancel any in-flight init and destroy the SDK's widgets so a
+    // stray floating cart toggle can't linger or stack up on remount.
+    return () => {
+      cancelled = true;
+      teardown();
+    };
   }, []);
 
   return <div ref={nodeRef} className="shopify-buy-button" />;
